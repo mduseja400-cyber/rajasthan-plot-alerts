@@ -1,29 +1,20 @@
 import os
 import re
+import sys
 import time
+import subprocess
 import requests
 from bs4 import BeautifulSoup
 
-# ── Config ──────────────────────────────────────────────
-BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
-SEEN_FILE  = "seen_auctions.txt"
-BASE_URL   = "https://udhonline.rajasthan.gov.in"
-LIST_URL   = BASE_URL + "/Portal/AuctionListNew"
-API_URL    = BASE_URL + "/Portal/GetLiveAuctionDetailedReport"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+SEEN_FILE = "seen_auctions.txt"
+BASE_URL  = "https://udhonline.rajasthan.gov.in"
+LIST_URL  = BASE_URL + "/Portal/AuctionListNew"
+API_URL   = BASE_URL + "/Portal/GetLiveAuctionDetailedReport"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
-    "Referer": BASE_URL + "/Portal/AuctionListNew",
-}
 
-# ── Helpers ──────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────
 def send_telegram(message):
     try:
         r = requests.post(
@@ -36,13 +27,14 @@ def send_telegram(message):
         print(f"  Telegram error: {e}")
 
 
+# ── seen_auctions ────────────────────────────────────────
 def load_seen():
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            seen = {line.strip() for line in f if line.strip()}
+            seen = {l.strip() for l in f if l.strip()}
     else:
         seen = set()
-    print(f"Loaded {len(seen)} previously seen IDs")
+    print(f"Loaded {len(seen)} seen IDs")
     return seen
 
 
@@ -53,14 +45,68 @@ def save_seen(seen):
     print(f"Saved {len(seen)} IDs")
 
 
-# ── Parsing ──────────────────────────────────────────────
-def parse_auctions_from_html(html):
+# ── Fetch via curl (bypasses Python requests fingerprint) ─
+def fetch_url_curl(url, post_data=None):
     """
-    Parse auction rows from table HTML.
-    Each auction occupies 2 consecutive <tr> tags:
-      TR1: Id, Title, Scheme, Property No, Area, Usage, EMD dates
-      TR2: BSP price info
+    Use system curl — different TLS fingerprint than Python requests,
+    more likely to pass WAF checks.
     """
+    cmd = [
+        "curl", "-s", "--max-time", "30",
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "-H", "Accept-Language: en-IN,en;q=0.9,hi;q=0.8",
+        "-H", f"Referer: {LIST_URL}",
+        "-H", "Connection: keep-alive",
+        "--compressed",
+        "-L",  # follow redirects
+    ]
+    if post_data:
+        cmd += ["--data-urlencode", "dummy=1"]  # force POST
+        for k, v in post_data.items():
+            cmd += ["-d", f"{k}={v}"]
+    cmd.append(url)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+        if result.returncode == 0 and len(result.stdout) > 200:
+            return result.stdout
+    except Exception as e:
+        print(f"  curl error: {e}")
+    return None
+
+
+def fetch_url_requests(url, session, post_data=None):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+        "Referer": LIST_URL,
+    }
+    try:
+        if post_data:
+            r = session.post(url, data=post_data, headers=headers, timeout=30)
+        else:
+            r = session.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        if len(r.text) > 200:
+            return r.text
+    except Exception as e:
+        print(f"  requests error: {e}")
+    return None
+
+
+def fetch_page(url, session, post_data=None):
+    """Try requests first, fall back to curl."""
+    html = fetch_url_requests(url, session, post_data)
+    if html:
+        return html
+    print("  requests failed, trying curl...")
+    return fetch_url_curl(url, post_data)
+
+
+# ── Parse auctions from HTML ──────────────────────────────
+def parse_auctions(html):
     soup = BeautifulSoup(html, "html.parser")
     tables = soup.find_all("table")
     if not tables:
@@ -70,61 +116,76 @@ def parse_auctions_from_html(html):
     rows = main_table.find_all("tr")
 
     auctions = []
-    i = 0
-    while i < len(rows):
-        row_text = rows[i].get_text(" ", strip=True)
+    for i, row in enumerate(rows):
+        row_text = row.get_text(" ", strip=True)
         id_match = re.search(r"Id\s*:\s*(\d+)", row_text)
+        if not id_match:
+            continue
 
-        if id_match:
-            auction_id = id_match.group(1)
+        auction_id = id_match.group(1)
+        full = row_text
+        if i + 1 < len(rows):
+            full += " " + rows[i + 1].get_text(" ", strip=True)
 
-            # Combine 2 rows for full details
-            full_text = row_text
-            if i + 1 < len(rows):
-                full_text += " " + rows[i + 1].get_text(" ", strip=True)
+        def ex(pattern):
+            m = re.search(pattern, full)
+            return m.group(1).strip() if m else ""
 
-            def extract(pattern, text=full_text):
-                m = re.search(pattern, text)
-                return m.group(1).strip() if m else ""
-
-            auctions.append({
-                "id":      auction_id,
-                "title":   extract(r"Title\s*:\s*(.+?)(?:Scheme Name\s*:|$)"),
-                "scheme":  extract(r"Scheme Name\s*:\s*(.+?)(?:Property Number\s*:|$)"),
-                "prop_no": extract(r"Property Number\s*:\s*(.+?)(?:Property Area\s*:|$)"),
-                "area":    extract(r"Property Area\s*:\s*(.+?)(?:Usage Type\s*:|$)"),
-                "usage":   extract(r"Usage Type\s*:\s*(.+?)(?:EMD|$)"),
-                "emd_end": extract(r"EMD Deposit End Date\s*:\s*(.+?)(?:Auction Date|Last|Bid|$)")[:25],
-                "bsp":     extract(r"(?:Bid Start Price|BSP).*?:\s*([\d,]+\.?\d*)"),
-            })
-
-        i += 1
+        auctions.append({
+            "id":      auction_id,
+            "title":   ex(r"Title\s*:\s*(.+?)(?:Scheme Name\s*:|$)"),
+            "scheme":  ex(r"Scheme Name\s*:\s*(.+?)(?:Property Number\s*:|$)"),
+            "prop_no": ex(r"Property Number\s*:\s*(.+?)(?:Property Area\s*:|$)"),
+            "area":    ex(r"Property Area\s*:\s*(.+?)(?:Usage Type\s*:|$)"),
+            "usage":   ex(r"Usage Type\s*:\s*(.+?)(?:EMD|$)"),
+            "emd_end": ex(r"EMD Deposit End Date\s*:\s*(.+?)(?:Auction|Last|Bid|$)")[:25],
+            "bsp":     ex(r"(?:Bid Start Price|BSP).*?:\s*([\d,]+\.?\d*)"),
+        })
 
     return auctions
 
 
-# ── Fetching ─────────────────────────────────────────────
-def get_all_auctions(session):
-    """
-    Fetch all pages from GetLiveAuctionDetailedReport.
-    First load the main page to get SchemeId/UnitId hidden form values,
-    then POST to the API for each page.
-    """
-    print(f"\nFetching main page: {LIST_URL}")
-    try:
-        resp = session.get(LIST_URL, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  Main page fetch failed: {e}")
-        return []
+# ── Main ─────────────────────────────────────────────────
+def main():
+    print("=" * 55)
+    print("JDA Auction Alert Bot")
+    print("=" * 55)
 
-    # Extract hidden form values (SchemeId, UnitId, pageSize)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    form = soup.find("form", id="SearchForm") or soup.find("form")
+    if not BOT_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN not set"); sys.exit(1)
+    if not CHAT_ID:
+        print("ERROR: TELEGRAM_CHAT_ID not set"); sys.exit(1)
 
-    scheme_id  = ""
-    unit_id    = ""
-    page_size  = "30"
+    seen    = load_seen()
+    session = requests.Session()
+
+    # ── Step 1: Fetch page 1 (main listing page) ──
+    print(f"\nFetching page 1: {LIST_URL}")
+    html1 = fetch_page(LIST_URL, session)
+
+    if not html1:
+        print("FATAL: Could not fetch page 1")
+        send_telegram(
+            "⚠️ <b>JDA Alert Bot Error</b>\n\n"
+            "Website fetch fail ho gayi.\n"
+            "Possible reasons:\n"
+            "• Website temporarily down\n"
+            "• IP block by server\n\n"
+            "Manual check: udhonline.rajasthan.gov.in"
+        )
+        return
+
+    # Save debug
+    with open("debug_page1.html", "w", encoding="utf-8") as f:
+        f.write(html1)
+
+    all_auctions = parse_auctions(html1)
+    print(f"  Page 1: {len(all_auctions)} auctions found")
+
+    # ── Step 2: Extract form params for pagination ──
+    soup      = BeautifulSoup(html1, "html.parser")
+    form      = soup.find("form", id="SearchForm") or soup.find("form")
+    scheme_id = unit_id = page_size = ""
 
     if form:
         def fval(name):
@@ -136,30 +197,19 @@ def get_all_auctions(session):
 
     print(f"  SchemeId={scheme_id} UnitId={unit_id} PageSize={page_size}")
 
-    # Find how many pages exist
+    # Find max page
     page_links = soup.find_all("a", href=lambda h: h and "GetLiveAuctionDetailedReport" in h)
     max_page = 1
-    for link in page_links:
-        m = re.search(r"page=(\d+)", link.get("href", ""))
+    for lnk in page_links:
+        m = re.search(r"page=(\d+)", lnk.get("href", ""))
         if m:
             max_page = max(max_page, int(m.group(1)))
+    print(f"  Total pages: {max_page}")
 
-    print(f"  Total pages to fetch: {max_page}")
-
-    # Parse page 1 from what we already have
-    all_auctions = parse_auctions_from_html(resp.text)
-    print(f"  Page 1: {len(all_auctions)} auctions")
-
-    # Fetch remaining pages via POST
-    post_headers = {
-        **HEADERS,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
+    # ── Step 3: Fetch pages 2..N ──
     for page in range(2, max_page + 1):
-        time.sleep(1)  # Polite delay
-        params = {
+        time.sleep(1.5)
+        post_data = {
             "page":        str(page),
             "Paging":      "True",
             "pageSize":    page_size or "30",
@@ -170,53 +220,27 @@ def get_all_auctions(session):
             "IsCorner":    "0",
             "Flag":        "",
         }
-        try:
-            r = session.post(API_URL, data=params, headers=post_headers, timeout=30)
-            r.raise_for_status()
-            page_auctions = parse_auctions_from_html(r.text)
+        print(f"\nFetching page {page}...")
+        html_p = fetch_page(API_URL, session, post_data)
+        if html_p:
+            page_auctions = parse_auctions(html_p)
             all_auctions.extend(page_auctions)
             print(f"  Page {page}: {len(page_auctions)} auctions")
-        except Exception as e:
-            print(f"  Page {page} error: {e}")
+        else:
+            print(f"  Page {page}: fetch failed, skipping")
 
-    return all_auctions
-
-
-# ── Main ─────────────────────────────────────────────────
-def main():
-    print("=" * 55)
-    print("JDA Auction Alert Bot")
-    print("=" * 55)
-
-    if not BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN not set"); return
-    if not CHAT_ID:
-        print("ERROR: TELEGRAM_CHAT_ID not set"); return
-
-    seen = load_seen()
-    session = requests.Session()
-
-    all_auctions = get_all_auctions(session)
     print(f"\nTotal auctions fetched: {len(all_auctions)}")
 
-    if not all_auctions:
-        send_telegram(
-            "⚠️ <b>JDA Alert Bot Error</b>\n\n"
-            "Auctions fetch nahi ho sake.\n"
-            "Manual check karein: udhonline.rajasthan.gov.in"
-        )
-        return
-
+    # ── Step 4: Send alerts for new auctions ──
     new_count = 0
     for a in all_auctions:
         if a["id"] in seen:
             continue
 
         print(f"  NEW: ID={a['id']} | {a['title'][:50]}")
-
-        message = (
+        msg = (
             f"🏠 <b>NEW JDA AUCTION ALERT</b>\n\n"
-            f"<b>Auction ID:</b> {a['id']}\n"
+            f"<b>ID:</b> {a['id']}\n"
             f"<b>Title:</b> {a['title']}\n"
             f"<b>Scheme:</b> {a['scheme']}\n"
             f"<b>Property No:</b> {a['prop_no']}\n"
@@ -224,15 +248,15 @@ def main():
             f"<b>Usage:</b> {a['usage']}\n"
             f"<b>BSP:</b> ₹{a['bsp']}\n"
             f"<b>EMD End:</b> {a['emd_end']}\n\n"
-            f"🔗 <a href='https://udhonline.rajasthan.gov.in/Portal/AuctionListNew'>Portal Link</a>"
+            f"🔗 <a href='{LIST_URL}'>Portal Link</a>"
         )
-        send_telegram(message)
+        send_telegram(msg)
         seen.add(a["id"])
         new_count += 1
         time.sleep(1)
 
     save_seen(seen)
-    print(f"\n✅ Done. New auctions: {new_count} | Total tracked: {len(seen)}")
+    print(f"\n✅ Done. New: {new_count} | Total tracked: {len(seen)}")
 
 
 if __name__ == "__main__":
