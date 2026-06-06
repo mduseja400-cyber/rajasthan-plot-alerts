@@ -20,7 +20,10 @@ soup = BeautifulSoup(response.text, "html.parser")
 
 title = soup.title.text.strip() if soup.title else "UDH Auction Page"
 
-message = f"""🔔 Rajasthan Auction Check
+message = """🚨 TEST 12345
+
+Agar ye message aaya hai to GitHub latest code run kar raha hai.
+"""
 
 Portal Status: Accessible ✅
 Page Title: {title}
