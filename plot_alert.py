@@ -62,5 +62,9 @@ for li in soup.find_all("li"):
 with open("seen_auctions.txt", "w", encoding="utf-8") as f:
     for item in sorted(seen):
         f.write(item + "\n")
+ print("Total LI tags:", len(soup.find_all("li")))
+
+for li in soup.find_all("li")[:20]:
+    print("DEBUG:", repr(li.get_text(" ", strip=True)))       
 
 print(f"New auctions found: {len(new_ids)}")
