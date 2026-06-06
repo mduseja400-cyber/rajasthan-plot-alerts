@@ -36,6 +36,11 @@ print("TITLE:", soup.title.get_text() if soup.title else "No title")
 print("FIRST 500 CHARS:")
 print(response.text[:500])
 
+with open("debug.html", "w", encoding="utf-8") as f:
+    f.write(response.text)
+
+print("Saved HTML to debug.html")
+
 new_ids = []
 
 # Find all Jaipur auction rows
