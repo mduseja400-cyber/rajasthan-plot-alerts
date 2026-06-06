@@ -19,7 +19,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: pip install requests beautifulsoup4
 
       - name: Run Script
         env:
