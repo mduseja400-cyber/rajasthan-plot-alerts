@@ -20,15 +20,9 @@ soup = BeautifulSoup(response.text, "html.parser")
 
 title = soup.title.text.strip() if soup.title else "UDH Auction Page"
 
-message = """🚨 TEST 12345
+message = """TEST 12345
 
-Agar ye message aaya hai to GitHub latest code run kar raha hai.
-"""
-
-Portal Status: Accessible ✅
-Page Title: {title}
-
-System checked UDH successfully.
+If you received this message, GitHub is running the latest code.
 """
 
 send_telegram(message)
