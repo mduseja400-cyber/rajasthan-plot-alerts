@@ -24,11 +24,32 @@ jobs:
       - name: Install Dependencies
         run: pip install requests beautifulsoup4
 
+      - name: Test website reachability
+        run: |
+          echo "Testing website..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -H "Accept: text/html,application/xhtml+xml" \
+            "https://udhonline.rajasthan.gov.in/Portal/AuctionListNew")
+          echo "HTTP Status: $STATUS"
+          if [ "$STATUS" = "403" ]; then
+            echo "WARNING: Website returning 403 - IP may be blocked"
+          fi
+
       - name: Run Script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python plot_alert.py
+
+      - name: Upload debug HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html-${{ github.run_number }}
+          path: debug_page1.html
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Save seen_auctions.txt to repo
         run: |
