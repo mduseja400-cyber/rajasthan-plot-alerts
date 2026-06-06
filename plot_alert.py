@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-URL = "https://udhonline.rajasthan.gov.in/Portal/ViewAuction"
+URL = "https://udhonline.rajasthan.gov.in/Portal/AuctionListNew"
 
 def send_telegram(message):
     requests.post(
