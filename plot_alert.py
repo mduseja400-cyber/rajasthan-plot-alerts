@@ -30,6 +30,11 @@ response = requests.get(URL, timeout=60)
 response.raise_for_status()
 
 soup = BeautifulSoup(response.text, "html.parser")
+print("STATUS:", response.status_code)
+print("URL:", response.url)
+print("TITLE:", soup.title.get_text() if soup.title else "No title")
+print("FIRST 500 CHARS:")
+print(response.text[:500])
 
 new_ids = []
 
